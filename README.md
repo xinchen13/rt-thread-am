@@ -33,3 +33,23 @@ make: *** [/home/xinchen/ysyx/abstract-machine/scripts/native.mk:25: run] Error 
 - 通过CTE实现RT-Thread中上下文的创建和切换功能 (下面来实现它)
 
 ## 上下文的创建
+实现`rt-thread-am/bsp/abstract-machine/src/context.c`中的`rt_hw_stack_init()`函数. 
+- 它的功能是以stack_addr为栈底创建一个入口为tentry, 参数为parameter的上下文, 并返回这个上下文结构的指针. 传入的stack_addr可能没有任何对齐限制, 最好将它对齐到`sizeof(uintptr_t)`再使用
+- 若上下文对应的内核线程从tentry返回, 则调用texit, RT-Thread会保证代码不会从texit中返回
+- CTE的`kcontext()`要求不能从入口返回, 因此需要一种新的方式来支持texit的功能. 一种方式是构造一个包裹函数, 让包裹函数来调用tentry, 并在tentry返回后调用texit, 然后将这个包裹函数作为`kcontext()`的真正入口, 不过这还要求我们将tentry, parameter和texit这三个参数传给包裹函数
+
+全局变量造成问题的原因是它会被多个线程共享, 应该使用不会被多个线程共享的存储空间"栈". 只需要让`rt_hw_stack_init()`将包裹函数的三个参数放在上下文的栈中, 将来包裹函数执行的时候就可以从栈中取出这三个参数, 而且系统中的其他线程都不能访问它们.
+
+最后还需要考虑参数数量的问题, `kcontext()` 要求入口函数只能接受一个类型为`void *`的参数. 不过我们可以自行约定用何种类型来解析这个参数(整数, 字符, 字符串, 指针等皆可)
+
+## 上下文切换
+实现`rt-thread-am/bsp/abstract-machine/src/context.c`中的`rt_hw_context_switch_to()`函数和`rt_hw_context_switch()`函数
+
+- `rt_ubase_t`类型其实是`unsigned long`, `to`和`from`都是指向上下文指针变量的指针(二级指针)
+- `rt_hw_context_switch_to()`用于切换到`to`指向的上下文指针变量所指向的上下文, 而`rt_hw_context_switch()`还需要额外将当前上下文的指针写入`from`指向的上下文指针变量中
+- 为了进行切换, 可以通过`yield()`触发一次自陷, 在事件处理回调函数`ev_handler()`中识别出EVENT_YIELD事件后, 再处理`to`和`from`. 同样地, 需要思考如何将`to`和`from`这两个参数传给`ev_handler()`. 
+
+根据分析, 上面两个功能的实现都需要处理一些特殊的参数传递问题. 对于上下文的切换, 以`rt_hw_context_switch()`为例, 我们需要在`rt_hw_context_switch()`中调用`yield()`, 然后在`ev_handler()`中获得`from`和`to`. `rt_hw_context_switch()`和`ev_handler()`是两个不同的函数, 但由于CTE机制的存在, 使得`rt_hw_context_switch()`不能直接调用`ev_handler()`. 因此, 一种直接的方式就是借助全局变量来传递信息
+
+## 其他
+在`rt-thread-am/bsp/abstract-machine/src/context.c`中还有一个`rt_hw_context_switch_interrupt()`函数, 目前RT-Thread的运行过程不会调用它, 因此目前可以忽略

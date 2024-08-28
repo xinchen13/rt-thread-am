@@ -51,5 +51,125 @@ make: *** [/home/xinchen/ysyx/abstract-machine/scripts/native.mk:25: run] Error 
 
 根据分析, 上面两个功能的实现都需要处理一些特殊的参数传递问题. 对于上下文的切换, 以`rt_hw_context_switch()`为例, 我们需要在`rt_hw_context_switch()`中调用`yield()`, 然后在`ev_handler()`中获得`from`和`to`. `rt_hw_context_switch()`和`ev_handler()`是两个不同的函数, 但由于CTE机制的存在, 使得`rt_hw_context_switch()`不能直接调用`ev_handler()`. 因此, 一种直接的方式就是借助全局变量来传递信息
 
+能否不使用全局变量来实现上下文的切换呢? 同样地, 需要寻找一种不会被多个线程共享的存储空间. 不过对于调用`rt_hw_context_switch()`的线程来说, 它的栈正在被使用, 往其中写入数据可能会被覆盖, 甚至可能会覆盖已有数据, 使当前线程崩溃. `to`的栈虽然当前不使用, 也不会被其他线程共享, 但需要考虑如何让`ev_handler()`访问到`to`的栈, 这又回到了我们一开始想要解决的问题.
+
+除了栈之外, 还有没有其他不会被多个线程共享的存储空间呢? 那就是PCB, 因为每个线程对应一个PCB, 而一个线程不会被同时调度多次, 所以通过PCB来传递信息也是一个可行的方案. 要获取当前线程的PCB, 自然是用current指针了
+
+在RT-Thread中, 可以通过调用`rt_thread_self()`返回当前线程的PCB. 阅读RT-Thread中PCB结构体的定义, 发现其中有一个成员`user_data`, 它用于存放线程的私有数据, 这意味着RT-Thread中调度相关的代码必定不会使用这个成员, 因此它很适合我们用来传递信息. 不过为了避免覆盖`user_data`中的已有数据, 我们可以先把它保存在一个临时变量中, 在下次切换回当前线程并从`rt_hw_context_switch()`返回之前再恢复它. 这个临时变量使用局部变量: 局部变量是在栈上分配的
+
 ## 其他
 在`rt-thread-am/bsp/abstract-machine/src/context.c`中还有一个`rt_hw_context_switch_interrupt()`函数, 目前RT-Thread的运行过程不会调用它, 因此目前可以忽略
+
+## 在 nemu 中运行 RT-Thread
+实现后, 尝试在NEMU中运行RT-Thread. 由于在移植后的RT-Thread中内置了一些Shell命令, 能看到RT-Thread启动后依次执行这些命令, 最后输出命令提示符`msh />`:
+
+```
+Welcome to riscv32-NEMU!
+For help, type "help"
+am-apps.data.size = ld, am-apps.bss.size = ld
+heap: [0x802da000 - 0x88000000]
+
+ \ | /
+- RT -     Thread Operating System
+ / | \     5.0.1 build Aug 28 2024 10:40:01
+ 2006 - 2022 Copyright by RT-Thread team
+[I/utest] utest is initialize success.
+[I/utest] total utest testcase num: (0)
+Hello RISC-V!
+msh />help
+RT-Thread shell commands:
+date             - get date and time or set (local timezone) [year month day hour min sec]
+list             - list objects
+version          - show RT-Thread version information
+clear            - clear the terminal screen
+free             - Show the memory usage in the system.
+ps               - List threads in the system.
+help             - RT-Thread shell help.
+tail             - print the last N - lines data of the given file
+echo             - echo string to file
+df               - disk free
+umount           - Unmount the mountpoint
+mount            - mount <device> <mountpoint> <fstype>
+mkfs             - format disk with file system
+mkdir            - Create the DIRECTORY.
+pwd              - Print the name of the current working directory.
+cd               - Change the shell working directory.
+rm               - Remove(unlink) the FILE(s).
+cat              - Concatenate FILE(s)
+mv               - Rename SOURCE to DEST.
+cp               - Copy SOURCE to DEST.
+ls               - List information about the FILEs.
+utest_run        - utest_run [-thread or -help] [testcase name] [loop num]
+utest_list       - output all utest testcase
+memtrace         - dump memory trace information
+memcheck         - check memory data
+am_fceux_am      - AM fceux_am
+am_snake         - AM snake
+am_typing_game   - AM typing_game
+am_microbench    - AM microbench
+am_hello         - AM hello
+
+msh />date
+[W/time] Cannot find a RTC device!
+local time: Thu Jan  1 08:00:00 1970
+timestamps: 0
+timezone: UTC+8
+msh />version
+
+ \ | /
+- RT -     Thread Operating System
+ / | \     5.0.1 build Aug 28 2024 10:40:01
+ 2006 - 2022 Copyright by RT-Thread team
+msh />free
+total    : 131227544
+used     : 33583576
+maximum  : 33583576
+available: 97643968
+msh />ps
+thread                   pri  status      sp     stack size max used left tick  error
+------------------------ ---  ------- ---------- ----------  ------  ---------- ---
+tshell                    20  running 0x000000a0 0x00001000    21%   0x0000000a OK
+sys workq                 23  ready   0x000000a0 0x00002000    01%   0x0000000a OK
+tidle0                    31  ready   0x000000a0 0x00004000    00%   0x00000020 OK
+timer                      4  suspend 0x000000a0 0x00004000    01%   0x0000000a OK
+main                      10  close   0x000000a0 0x00000800    16%   0x00000014 OK
+msh />pwd
+/
+msh />ls
+No such directory
+msh />memtrace
+
+memory heap address:
+name    : heap
+total   : 0x131227544
+used    : 0x33583576
+max_used: 0x33583608
+heap_ptr: 0x802da048
+lfree   : 0x822e1220
+heap_end: 0x87fffff0
+
+--memory item information --
+[0x802da048 -   32M] NONE
+[0x822da058 -   12K] NONE
+[0x822dd370 -   176] NONE
+[0x822dd430 -    2K] NONE
+[0x822ddc40 -    16] main
+[0x822ddc60 -    72] main
+[0x822ddcb8 -   176] main
+[0x822ddd78 -    8K] main
+[0x822dfd88 -   952] main
+[0x822e0150 -   176] main
+[0x822e0210 -    4K] main
+[0x822e1220 -   93M]     
+msh />memcheck
+msh />utest_list
+[I/utest] Commands list : 
+msh />
+```
+
+由于NEMU目前还不支持通过串口进行交互, 因此我们无法将终端上的输入传送到RT-Thread, 所有内置命令运行结束后, RT-Thread将进入空闲状态, 此时退出NEMU即可
+
+## 在 RT-Thread 上运行 AM 程序
+`make init`后`integrate-am-apps.py`中的`app_dir_list`数组中列出的AM程序编译到RT-Thread, 可以在内置的Shell命令中(位于`uart.c`)添加用于启动这些AM程序的命令(见help)
+
+运行后会产生非法访存, 暂未修复()
